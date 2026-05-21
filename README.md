@@ -2,6 +2,14 @@
 
 [ComfyUI](https://github.com/comfyanonymous/ComfyUI) nodes for performing the image-to-image diffusion process on large images in tiles. This approach improves the details that is commonly found on upscaled images while reducing hardware requirements and maintaining an image size that the diffusion model is trained on.
 
+## About this version of USDU
+
+This repository was forked from https://github.com/ssitu/ComfyUI_UltimateSDUpscale on 22nd May 2026 under the GPL 3.0 license in order to adapt it to work better with WAN based models and lowVRAM GPU systems (currently RTX 3060 12GB VRAM) in an attempt to get times down. I make no guarantee of its worthiness or ability to run on other hardware. - Mark, 22nd May 2026.
+
+## Changes v1.0 (22nd May 2026)
+
+For notes on what changes were made in v1.0, see [CHANGES_v1.0.md](CHANGES_v1.0.md)
+
 ## Installation
 
 
@@ -9,7 +17,7 @@
 1. Git must be installed on your system. Verify by running `git -v` in a terminal.
 2. Enter the following command from the terminal starting in ComfyUI/custom_nodes/
     ```
-    git clone https://github.com/ssitu/ComfyUI_UltimateSDUpscale
+    git clone https://github.com/mdkberry/ComfyUI_UltimateSDUpscale
     ```
 
 ### ComfyUI Manager
