@@ -16,13 +16,13 @@ from modules.processing import (
     StableDiffusionProcessing,
     clear_temporal_cache,
     encode_full_image,
-    should_skip_frame,
     cache_frame_latent,
     cache_frame_output,
     get_cached_output,
 )
 import modules.shared as shared
 from modules.upscaler import UpscalerData
+from nodes import VAEEncode
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ def USDU_base_inputs():
     required = [
         ("image", ("IMAGE", {"tooltip": "The image (or video frame batch) to upscale."})),
         # Sampling
-        ("model",       ("MODEL",       {"tooltip": "The model to use for image-to-image."})),
+        ("model",       ("MODEL",        {"tooltip": "The model to use for image-to-image."})),
         ("positive",    ("CONDITIONING", {"tooltip": "Positive conditioning for each tile."})),
         ("negative",    ("CONDITIONING", {"tooltip": "Negative conditioning for each tile."})),
         ("vae",         ("VAE",          {"tooltip": "VAE model to use for tiles."})),
@@ -78,7 +78,7 @@ def USDU_base_inputs():
         ("tile_height", ("INT",    {"default": 768,  "min": 64, "max": MAX_RESOLUTION, "step": 8})),
         ("mask_blur",   ("INT",    {"default": 8,    "min": 0,  "max": 64,   "step": 1})),
         ("tile_padding",("INT",    {"default": 32,   "min": 0,  "max": MAX_RESOLUTION, "step": 8})),
-        # Seam fix  – lighter defaults for video
+        # Seam fix – lighter defaults for video
         ("seam_fix_mode",    (list(SEAM_FIX_MODES.keys()), {})),
         ("seam_fix_denoise", ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01,
                                         "tooltip": "Lower values (0.2-0.4) are much faster for video."})),
@@ -98,7 +98,7 @@ def USDU_base_inputs():
         ("frame_skip_threshold", ("FLOAT",   {"default": 0.04, "min": 0.0, "max": 1.0, "step": 0.005,
                                               "tooltip": "Mean latent delta below which a frame is skipped. 0.02=aggressive, 0.06=conservative."})),
         ("seam_fix_stride",      ("INT",     {"default": 3,   "min": 1,   "max": 60,  "step": 1,
-                                              "tooltip": "Apply seam fix every N frames. 1=every frame, 3=every 3rd frame (3x faster seams for video)."})),
+                                              "tooltip": "Apply seam fix every N frames. 1=every frame, 3=every 3rd frame."})),
     ]
     optional = []
     return required, optional
@@ -129,6 +129,42 @@ def rename_input(inputs: list, old_name: str, new_name: str):
         if n == old_name:
             inputs[i] = (new_name, t)
             return
+
+
+# ---------------------------------------------------------------------------
+# Temporal frame skip helper (standalone, no dependency on processing module)
+# ---------------------------------------------------------------------------
+
+_prev_latent_cache: dict = {}
+
+
+def _check_temporal_skip(vae, frame_pil, frame_idx: int,
+                          threshold: float) -> bool:
+    """
+    Encode frame to latent, compare with previous frame's latent.
+    Returns True if the frame is similar enough to skip diffusion.
+    Caches the latent for next frame's comparison.
+    """
+    enc = VAEEncode()
+    ft = pil_to_tensor(frame_pil)
+    (fl,) = enc.encode(vae, ft)
+    current = fl["samples"]
+
+    skip = False
+    if frame_idx > 0 and frame_idx in _prev_latent_cache:
+        prev = _prev_latent_cache[frame_idx - 1]
+        if prev.shape == current.shape:
+            delta = (current - prev).abs().mean().item()
+            skip = (delta < threshold)
+
+    # Store for next frame
+    _prev_latent_cache[frame_idx] = current.detach().clone()
+    # Prune old entries
+    for k in list(_prev_latent_cache.keys()):
+        if k < frame_idx - 1:
+            del _prev_latent_cache[k]
+
+    return skip
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +199,8 @@ class UltimateSDUpscale:
         temporal_frame_skip=True, frame_skip_threshold=0.04, seam_fix_stride=3,
         custom_sampler=None, custom_sigmas=None,
     ):
-        redraw_mode   = MODES[mode_type]
-        seam_fix_mode = SEAM_FIX_MODES[seam_fix_mode]
+        redraw_mode      = MODES[mode_type]
+        seam_fix_mode_v  = SEAM_FIX_MODES[seam_fix_mode]
 
         assert batch_size == 1 or force_uniform_tiles, (
             "batch_size > 1 requires force_uniform_tiles=True."
@@ -179,59 +215,46 @@ class UltimateSDUpscale:
         shared.batch_as_tensor = image
 
         # Clear temporal cache at the start of each node execution
-        # (cache persists across tiles within one execution, not across calls)
         clear_temporal_cache()
+        _prev_latent_cache.clear()
 
-        logger.debug("UltimateSDUpscale.upscale() frames=%d batch_size=%d "
-                     "temporal_skip=%s stride=%d",
-                     len(shared.batch), batch_size, temporal_frame_skip, seam_fix_stride)
+        logger.debug(
+            "UltimateSDUpscale.upscale() frames=%d batch_size=%d "
+            "temporal_skip=%s threshold=%.3f seam_stride=%d",
+            len(shared.batch), batch_size,
+            temporal_frame_skip, frame_skip_threshold, seam_fix_stride,
+        )
 
         output_frames = []
+        all_frames = list(shared.batch)  # snapshot
 
-        for frame_idx, frame_pil in enumerate(shared.batch):
+        for frame_idx, frame_pil in enumerate(all_frames):
+
             # ---- Temporal frame skip check ----
             if temporal_frame_skip and frame_idx > 0:
-                # Encode current frame to latent for comparison
-                from usdu_utils import pil_to_tensor as _p2t
-                ft = _p2t(frame_pil)
-                (fl,) = StableDiffusionProcessing.__new__(
-                    StableDiffusionProcessing
-                ).__class__.__mro__[0]  # placeholder – use vae directly below
-                # Actually encode directly:
-                import torch as _torch
-                from nodes import VAEEncode as _VAEEncode
-                _enc = _VAEEncode()
-                (fl,) = _enc.encode(vae, ft)
-                current_latent = fl["samples"]
-
-                if should_skip_frame(
-                    type('_p', (), {
-                        'temporal_frame_skip': temporal_frame_skip,
-                        'frame_skip_threshold': frame_skip_threshold,
-                    })(),
-                    frame_idx,
-                    current_latent,
-                ):
+                skip = _check_temporal_skip(
+                    vae, frame_pil, frame_idx, frame_skip_threshold
+                )
+                if skip:
                     prev_out = get_cached_output(frame_idx - 1)
                     if prev_out is not None:
-                        logger.debug("Frame %d: latent delta below threshold, reusing prev output.", frame_idx)
+                        logger.debug(
+                            "Frame %d: latent delta below threshold (%.3f), reusing prev output.",
+                            frame_idx, frame_skip_threshold,
+                        )
                         output_frames.append(prev_out)
-                        cache_frame_latent(frame_idx, current_latent)
                         cache_frame_output(frame_idx, prev_out)
                         continue
 
-                cache_frame_latent(frame_idx, current_latent)
+            # ---- Set shared.batch to just this frame for the tile loop ----
+            shared.batch = [frame_pil]
 
             # ---- Build processing object for this frame ----
-            # Point shared.batch to just this frame so process_images works correctly
-            _saved_batch = shared.batch
-            shared.batch = [frame_pil] + list(shared.batch[1:])  # keep rest for batch sampling
-
             sdprocessing = StableDiffusionProcessing(
                 frame_pil, model, positive, negative, vae,
                 seed, steps, cfg, sampler_name, scheduler, denoise, upscale_by,
                 force_uniform_tiles, tiled_decode,
-                tile_width, tile_height, redraw_mode, seam_fix_mode,
+                tile_width, tile_height, redraw_mode, seam_fix_mode_v,
                 custom_sampler, custom_sigmas, batch_size,
                 temporal_frame_skip=temporal_frame_skip,
                 frame_skip_threshold=frame_skip_threshold,
@@ -243,7 +266,7 @@ class UltimateSDUpscale:
 
             # Determine if seam fix should run this frame
             apply_seam_fix = (frame_idx % seam_fix_stride == 0)
-            actual_seam_fix = seam_fix_mode if apply_seam_fix else usdu.USDUSFMode.NONE
+            actual_seam_fix = seam_fix_mode_v if apply_seam_fix else usdu.USDUSFMode.NONE
 
             with suppress_logging():
                 script = usdu.Script()
@@ -268,8 +291,6 @@ class UltimateSDUpscale:
             output_frames.append(result_pil)
             cache_frame_output(frame_idx, result_pil)
 
-            shared.batch = _saved_batch
-
         # Reassemble output tensor
         tensors = [pil_to_tensor(f) for f in output_frames]
         return (torch.cat(tensors, dim=0),)
@@ -293,7 +314,7 @@ class UltimateSDUpscaleNoUpscale(UltimateSDUpscale):
     FUNCTION = "upscale"
     CATEGORY = "image/upscaling"
     OUTPUT_TOOLTIPS = ("The final refined image / video frame batch.",)
-    DESCRIPTION = "WAN-optimised Ultimate SD Upscale (No Upscale). Runs tiled i2i on the input image without prior upscaling."
+    DESCRIPTION = "WAN-optimised USDU (No Upscale). Runs tiled i2i without prior upscaling."
 
     def upscale(
         self, upscaled_image, model, positive, negative, vae, seed,
@@ -324,16 +345,16 @@ class UltimateSDUpscaleCustomSample(UltimateSDUpscale):
     def INPUT_TYPES(s):
         required, optional = USDU_base_inputs()
         remove_input(required, "upscale_model")
-        optional.append(("upscale_model",   ("UPSCALE_MODEL", {"tooltip": "Optional. Omit to use Lanczos."})))
-        optional.append(("custom_sampler",  ("SAMPLER",  {"tooltip": "Custom sampler; requires custom_sigmas."})))
-        optional.append(("custom_sigmas",   ("SIGMAS",   {"tooltip": "Custom sigmas; requires custom_sampler."})))
+        optional.append(("upscale_model",  ("UPSCALE_MODEL", {"tooltip": "Optional. Omit to use Lanczos."})))
+        optional.append(("custom_sampler", ("SAMPLER",       {"tooltip": "Custom sampler; requires custom_sigmas."})))
+        optional.append(("custom_sigmas",  ("SIGMAS",        {"tooltip": "Custom sigmas; requires custom_sampler."})))
         return prepare_inputs(required, optional)
 
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "upscale"
     CATEGORY = "image/upscaling"
     OUTPUT_TOOLTIPS = ("The final upscaled image / video frame batch.",)
-    DESCRIPTION = "WAN-optimised Ultimate SD Upscale (Custom Sample)."
+    DESCRIPTION = "WAN-optimised USDU (Custom Sample)."
 
     def upscale(
         self, image, model, positive, negative, vae,

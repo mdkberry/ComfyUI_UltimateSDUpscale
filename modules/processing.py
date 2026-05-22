@@ -22,7 +22,6 @@ from nodes import common_ksampler, VAEEncode, VAEDecode, VAEDecodeTiled
 from comfy_extras.nodes_custom_sampler import SamplerCustom
 from usdu_utils import pil_to_tensor, tensor_to_pil, get_crop_region, expand_crop, crop_cond
 from modules import shared
-from tqdm import tqdm
 import comfy
 from enum import Enum
 
@@ -432,3 +431,17 @@ def cache_frame_output(frame_idx: int, pil_image):
 
 def get_cached_output(frame_idx: int):
     return _frame_output_cache.get(frame_idx)
+
+
+# ---------------------------------------------------------------------------
+# Compatibility alias – usdu_patch.py (current ssitu upstream) imports this
+# name. It is functionally identical to process_images; the "batch" aspect is
+# handled inside process_images via shared.batch already.
+# ---------------------------------------------------------------------------
+
+def process_batch_tiles(p: StableDiffusionProcessing) -> Processed:
+    """
+    Compatibility shim for usdu_patch.py which imports this name.
+    Delegates to process_images() which handles the full tile + batch logic.
+    """
+    return process_images(p)
