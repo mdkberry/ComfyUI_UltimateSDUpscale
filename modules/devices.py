@@ -1,7 +1,8 @@
 # modules/devices.py
 import torch
 
+
 def torch_gc():
-    """Trigger CUDA garbage collection to free memory between tiles."""
+    """Free CUDA memory between tiles — important on 12 GB VRAM with WAN."""
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
