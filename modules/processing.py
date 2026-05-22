@@ -434,14 +434,122 @@ def get_cached_output(frame_idx: int):
 
 
 # ---------------------------------------------------------------------------
-# Compatibility alias – usdu_patch.py (current ssitu upstream) imports this
-# name. It is functionally identical to process_images; the "batch" aspect is
-# handled inside process_images via shared.batch already.
+# process_batch_tiles
+#
+# Called by usdu_patch.py's patched linear_process / chess_process:
+#
+#   shared.batch = process_batch_tiles(p, tiles_to_process, shared.batch, self.calc_rectangle)
+#
+# Arguments:
+#   p                – StableDiffusionProcessing instance (carries model, vae, etc.)
+#   tiles_to_process – list of (xi, yi) tile grid coordinates in this batch
+#   batch            – list of PIL images being built (shared.batch); one frame per video frame.
+#                      For a single image this is always length-1.
+#   calc_rectangle   – callable(xi, yi) → (x1, y1, x2, y2) pixel coords on the canvas
+#
+# Returns:
+#   updated batch list with the processed tiles composited back in
 # ---------------------------------------------------------------------------
 
-def process_batch_tiles(p: StableDiffusionProcessing) -> Processed:
+def process_batch_tiles(p: StableDiffusionProcessing,
+                        tiles_to_process: list,
+                        batch: list,
+                        calc_rectangle) -> list:
     """
-    Compatibility shim for usdu_patch.py which imports this name.
-    Delegates to process_images() which handles the full tile + batch logic.
+    Encode all tiles in tiles_to_process as a single batched latent, run one
+    ksampler call, decode the batch, then composite each result back onto the
+    corresponding position in every image in `batch`.
+
+    This is the hot path for batch_size > 1 on video frames with WAN.
     """
-    return process_images(p)
+    from PIL import ImageDraw as _ILD
+
+    if not tiles_to_process or not batch:
+        return batch
+
+    results = [img.copy() for img in batch]   # work on copies; return updated list
+    canvas_w, canvas_h = results[0].width, results[0].height
+
+    # ---- target tile dimensions from p (set by init_draw before this call) ----
+    target_w = p.width
+    target_h = p.height
+
+    # ---- Gather crops for every tile × every frame in batch ----
+    # Layout: [tile0_frame0, tile0_frame1, ..., tile1_frame0, tile1_frame1, ...]
+    # We process tiles sequentially (each tile gets its own ksampler call) but
+    # encode/decode across the whole image batch at once for each tile.
+    # This mirrors what process_images does for batch_size crops.
+
+    for xi, yi in tiles_to_process:
+        x1, y1, x2, y2 = calc_rectangle(xi, yi)
+        # Clamp to canvas bounds
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(canvas_w, x2), min(canvas_h, y2)
+        orig_crop_w = x2 - x1
+        orig_crop_h = y2 - y1
+
+        if orig_crop_w <= 0 or orig_crop_h <= 0:
+            continue
+
+        # Crop each frame and resize to target tile size
+        tile_crops = []
+        for frame in results:
+            crop = frame.crop((x1, y1, x2, y2))
+            if crop.size != (target_w, target_h):
+                crop = crop.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            tile_crops.append(crop)
+
+        # Build conditioning crop region for crop_cond
+        # init_size is the original pre-upscale image size stored on p
+        crop_region = (x1, y1, x2, y2)
+        init_image  = results[0]   # reference frame for conditioning crop
+        tile_size   = (target_w, target_h)
+
+        positive_c = crop_cond(p.positive, crop_region, p.init_size, init_image.size, tile_size)
+        negative_c = crop_cond(p.negative, crop_region, p.init_size, init_image.size, tile_size)
+
+        # Encode all frames' crops in one VAE call  (N, H, W, 3) → latent
+        batched_tensor = torch.cat([pil_to_tensor(t) for t in tile_crops], dim=0)
+        (latent,) = p.vae_encoder.encode(p.vae, batched_tensor)
+
+        # Sample
+        samples = sample(p.model, p.seed, p.steps, p.cfg,
+                         p.sampler_name, p.scheduler,
+                         positive_c, negative_c, latent, p.denoise,
+                         p.custom_sampler, p.custom_sigmas)
+
+        # Decode
+        if not p.tiled_decode:
+            (decoded,) = p.vae_decoder.decode(p.vae, samples)
+        else:
+            (decoded,) = p.vae_decoder_tiled.decode(p.vae, samples, 512)
+
+        # NaN/Inf guard
+        decoded = torch.nan_to_num(decoded, nan=0.0, posinf=1.0, neginf=0.0)
+
+        # Composite each decoded tile back onto its frame
+        for i in range(min(len(results), decoded.shape[0])):
+            tile_out = tensor_to_pil(decoded, i)
+
+            # Resize back to original crop dimensions if needed
+            if tile_out.size != (orig_crop_w, orig_crop_h):
+                tile_out = tile_out.resize((orig_crop_w, orig_crop_h), Image.Resampling.LANCZOS)
+
+            # Build soft-edge blend mask matching mask_blur on p
+            blur_r = getattr(p, 'mask_blur', 8)
+            mask = Image.new('L', (orig_crop_w, orig_crop_h), 255)
+            if blur_r > 0:
+                from PIL import ImageFilter
+                mask = mask.filter(ImageFilter.GaussianBlur(blur_r))
+
+            # Paste with mask onto a working RGBA composite
+            base  = results[i].convert('RGBA')
+            layer = Image.new('RGBA', base.size, (0, 0, 0, 0))
+            layer.paste(tile_out.convert('RGBA'), (x1, y1))
+            alpha = Image.new('L', base.size, 0)
+            alpha.paste(mask, (x1, y1))
+            layer.putalpha(alpha)
+            base.alpha_composite(layer)
+            results[i] = base.convert('RGB')
+
+    return results
