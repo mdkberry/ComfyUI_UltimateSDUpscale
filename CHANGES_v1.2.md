@@ -20,7 +20,8 @@
 | `modules/scripts.py` | Unchanged | |
 
 All other files (`__init__.py`, `usdu_patch.py`, `repositories/`, `crop_model_patch.py`,
-`gradio.py`, `pyproject.toml`, `config.json.example`) are **unchanged** from upstream.
+`gradio.py`, `pyproject.toml`, `config.json.example`) are **unchanged** from upstream —
+do not replace them.
 
 ---
 
