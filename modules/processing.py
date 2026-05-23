@@ -21,7 +21,7 @@ import math
 from nodes import common_ksampler, VAEEncode, VAEDecode, VAEDecodeTiled
 from comfy_extras.nodes_custom_sampler import SamplerCustom
 from usdu_utils import pil_to_tensor, tensor_to_pil, get_crop_region, expand_crop, crop_cond
-from modules import shared
+from . import shared
 import comfy
 from enum import Enum
 
@@ -471,7 +471,7 @@ def process_batch_tiles(p: StableDiffusionProcessing,
     ComfyUI console window.
     """
     from PIL import ImageFilter, ImageDraw
-    from modules import shared as _shared
+    from . import shared as _shared
 
     if not tiles_to_process or not batch:
         return batch
