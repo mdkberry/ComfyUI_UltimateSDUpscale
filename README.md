@@ -1,5 +1,7 @@
 # ComfyUI_UltimateSDUpscale
 
+***NOTE: as at 23rd May 2026 this is worse in speed and end result that the original from ssitu so I recommend not using it. I will work on it some more when I get time, Mark 23rd May 2026.***
+
 [ComfyUI](https://github.com/comfyanonymous/ComfyUI) nodes for performing the image-to-image diffusion process on large images in tiles. This approach improves the details that is commonly found on upscaled images while reducing hardware requirements and maintaining an image size that the diffusion model is trained on.
 
 ## About this version of USDU
