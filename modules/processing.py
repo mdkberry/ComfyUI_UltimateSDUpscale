@@ -21,7 +21,11 @@ import math
 from nodes import common_ksampler, VAEEncode, VAEDecode, VAEDecodeTiled
 from comfy_extras.nodes_custom_sampler import SamplerCustom
 from usdu_utils import pil_to_tensor, tensor_to_pil, get_crop_region, expand_crop, crop_cond
-from . import shared
+try:
+    from . import shared          # works when loaded as package
+except ImportError:
+    import shared                 # works when loaded via sys.path
+
 import comfy
 from enum import Enum
 
@@ -471,7 +475,6 @@ def process_batch_tiles(p: StableDiffusionProcessing,
     ComfyUI console window.
     """
     from PIL import ImageFilter, ImageDraw
-    from . import shared as _shared
 
     if not tiles_to_process or not batch:
         return batch
@@ -483,9 +486,10 @@ def process_batch_tiles(p: StableDiffusionProcessing,
     target_h      = p.height
 
     # WAN optimisation flags stored on shared by usdu_nodes
-    do_temp_skip  = getattr(_shared, 'temporal_frame_skip',  False)
-    skip_thresh   = getattr(_shared, 'frame_skip_threshold', 0.04)
-    skip_cache    = getattr(_shared, 'frame_skip_cache',     {})   # {frame_idx: PIL result}
+    # shared is imported at module level at the top of this file
+    do_temp_skip  = getattr(shared, 'temporal_frame_skip',  False)
+    skip_thresh   = getattr(shared, 'frame_skip_threshold', 0.04)
+    skip_cache    = getattr(shared, 'frame_skip_cache',     {})   # {frame_idx: PIL result}
 
     # We process each tile spatially across ALL frames before moving to next tile.
     # This keeps the model hot and avoids re-loading between tiles.
