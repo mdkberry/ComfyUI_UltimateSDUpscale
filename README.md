@@ -6,9 +6,9 @@
 
 This repository was forked from https://github.com/ssitu/ComfyUI_UltimateSDUpscale on 22nd May 2026 under the GPL 3.0 license in order to adapt it to work better with WAN based models and lowVRAM GPU systems (currently RTX 3060 12GB VRAM) in an attempt to get times down. I make no guarantee of its worthiness or ability to run on other hardware. - Mark, 22nd May 2026.
 
-## Changes v1.3 (22nd May 2026)
+## Changes after fork (22nd May 2026)
 
-For notes on what changes were made in v1.3, see [CHANGES_v1.3.md](CHANGES_v1.3.md)
+For notes on what changes were made see [CHANGES.md](CHANGES.md)
 
 ## Installation
 
